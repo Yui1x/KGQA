@@ -13,7 +13,9 @@ from search import (
     build_incomplete_aggregation,
     extract_query_slots,
     extract_topic_entities,
+    repair_entity_packets,
     search_single_entity,
+    unresolved_mention_packets,
 )
 from utils import dump_json, load_qa_csv, save_results_csv, slice_rows, track_llm_usage
 
@@ -45,7 +47,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--neo4j_uri", type=str, default=os.getenv("KGQA_NEO4J_URI", os.getenv("NEO4J_URI", "")))
     parser.add_argument("--neo4j_user", type=str, default=os.getenv("KGQA_NEO4J_USER", os.getenv("NEO4J_USER", "")))
     parser.add_argument("--neo4j_password", type=str, default=os.getenv("KGQA_NEO4J_PASSWORD", os.getenv("NEO4J_PASSWORD", "")))
+    # Revision switches (2026-11-17); see the "run options" block in search.py.
+    parser.add_argument("--ablation", type=str, default="full",
+                        choices=["full", "wo_slot_coverage", "wo_sufficiency_check", "wo_abstention",
+                                 "entity_target_only", "wo_constraint_slot"])
+    parser.add_argument("--sufficiency_mode", type=str, default="joint", choices=["joint", "per_path"])
+    parser.add_argument("--structural_rule", type=str, default="on", choices=["on", "off"])
+    parser.add_argument("--entity_guard", type=str, default="on", choices=["on", "off"])
+    parser.add_argument("--repair", type=str, default="off", choices=["on", "off"])
+    parser.add_argument("--joint_pool_size", type=int, default=20)
+    parser.add_argument("--judge_max_tokens", type=int, default=4096)
+    parser.add_argument("--field_completion", type=str, default="on", choices=["on", "off"])
+    parser.add_argument("--slot_guided_expansion", type=str, default="on", choices=["on", "off"])
     return parser
+
+
+def run_options(args) -> dict[str, Any]:
+    """The configuration that determines a run's behaviour, written to every record."""
+    return {
+        "model": getattr(args, "LLM_type", ""),
+        "entity_model": getattr(args, "entity_model", "") or getattr(args, "LLM_type", ""),
+        "ablation": getattr(args, "ablation", "full"),
+        "sufficiency_mode": getattr(args, "sufficiency_mode", "joint"),
+        "structural_rule": getattr(args, "structural_rule", "on"),
+        "entity_guard": getattr(args, "entity_guard", "on"),
+        "repair": getattr(args, "repair", "off"),
+        "field_completion": getattr(args, "field_completion", "on"),
+        "slot_guided_expansion": getattr(args, "slot_guided_expansion", "on"),
+        "width": getattr(args, "width", None),
+        "depth": getattr(args, "depth", None),
+        "joint_pool_size": getattr(args, "joint_pool_size", 20),
+        "judge_max_tokens": getattr(args, "judge_max_tokens", 4096),
+        "max_length": getattr(args, "max_length", None),
+    }
 
 
 def _resolve_rows(args) -> list[dict[str, str]]:
@@ -140,6 +174,21 @@ def finalize_entity_packets(
             "ok",
         )
 
+    # wo_abstention: instead of returning the insufficient-evidence template,
+    # call the generator on whatever partial evidence was collected. This is the
+    # variant that shows what the abstention rule is buying -- the answers below
+    # are exactly the fluent-but-unsupported outputs the framework is designed
+    # to suppress, so the variant is expected to raise hallucination and lower
+    # nothing else.
+    ablation = str(getattr(args, "ablation", "full") or "full")
+    if ablation == "wo_abstention":
+        partial = aggregate_entity_packets(question, entity_packets, args, query_plan=query_plan)
+        return (
+            partial,
+            "forced_generation_on_partial_evidence",
+            "abstention disabled for ablation",
+        )
+
     return (
         build_incomplete_aggregation(entity_packets, args),
         "partial_or_insufficient",
@@ -165,6 +214,12 @@ def run_pipeline(args, rows: list[dict[str, str]] | None = None, dataset_name: s
                     search_single_entity(question, entity, graph_client, args, query_slots=query_slots)
                     for entity in topic_entities
                 ]
+                entity_packets, repair_log = repair_entity_packets(
+                    question, entity_packets, graph_client, args, query_slots
+                )
+                # Parsed mentions the entity guard could not confirm count as
+                # chemicals without evidence, so the question abstains.
+                entity_packets = entity_packets + unresolved_mention_packets(query_slots)
                 final_result, end_mode, remark = finalize_entity_packets(
                     question, topic_entities, entity_packets, args
                 )
@@ -174,6 +229,10 @@ def run_pipeline(args, rows: list[dict[str, str]] | None = None, dataset_name: s
                 "index": index,
                 "question": question,
                 "reference_answer": reference_answer,
+                "options": run_options(args),
+                "slots": {k: v for k, v in query_slots.items() if not str(k).startswith("_")},
+                "resolution": query_slots.get("_resolution", {}),
+                "repair_log": repair_log,
                 "topic_entities": topic_entities,
                 "entity_packets": entity_packets,
                 "answer": final_result["answer"],
@@ -208,6 +267,10 @@ def save_outputs(results: list[dict[str, Any]], args, dataset_name: str | None =
         {
             "question": item["question"],
             "ground_truth": item["reference_answer"],
+            "options": item.get("options", {}),
+            "slots": item.get("slots", {}),
+            "resolution": item.get("resolution", {}),
+            "repair_log": item.get("repair_log", []),
             "topic_entities": item["topic_entities"],
             "answer": item["answer"],
             "evidence": item["evidence"],

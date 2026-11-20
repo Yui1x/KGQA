@@ -9,6 +9,26 @@ SCEPS is a knowledge graph question answering framework for hazardous-waste safe
 - `KG_QA/`: SCEPS graph search and question-answering code.
 - `Question&Answer/`: 400 single-hop, 150 multi-hop, and 150 hallucination-control questions with reference answers.
 - `Result/Ablation/`: archived outputs and evaluation results for the ablation experiments.
+- `Result/Revision/`: per-question outputs for the revised experiments (all baselines and ablations), the per-question label file, and the knowledge-graph audit materials (annotator sheets, key files, LLM third votes, annotation guideline).
+- `tools/`: scripts used to run the baselines, ablations, and KG audit, including the parallel runner.
+
+## Revision run options
+
+The revised code exposes the ablation switches as CLI flags on `KG_QA/main.py`:
+
+```text
+--ablation {full,wo_slot_coverage,wo_sufficiency_check,wo_abstention,entity_target_only,wo_constraint_slot}
+--sufficiency_mode {joint,per_path}
+--structural_rule {on,off}
+--entity_guard {on,off}
+--repair {on,off}
+--field_completion {on,off}
+--slot_guided_expansion {on,off}
+--joint_pool_size INT
+--judge_max_tokens INT
+```
+
+The resolved configuration is written to every output record, so results are reproducible from the JSONL alone.
 
 ## Requirements and installation
 

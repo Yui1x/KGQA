@@ -14,18 +14,34 @@ ENTITY_EXTRACTION_SYSTEM = (
 
 
 def build_entity_extraction_prompt(question: str) -> str:
+    # v2 (2026-11-17 revision): `constraint` now means the conditions that
+    # change which graph fact applies (concentration, physical form,
+    # formulation, item, exposure route), matching the paper's definition of
+    # K_q. The previous wording asked for degree words such as 最早/一般, which
+    # is why removing the constraint slot had no measurable effect. The bridge
+    # vs target distinction is also spelled out, because the parser used to
+    # put the asked field into `bridge` for questions like
+    # "X的一个燃烧产物是什么", leaving `target` empty.
     return (
-        "请对下面问题做轻量槽位化解析。\n"
+        "请对下面问题做槽位化解析。\n"
         "要求：\n"
-        "1. chemicals: 只抽取问题中直接出现的化学品，数量不固定，可以是0个、1个或多个。\n"
-        "2. 必须保留题目中的完整化学品写法，不能丢掉括号、位次词、前后缀等表面形式。\n"
-        "   例如：(对)异丙基苯酚 不能简化成 异丙基苯酚。\n"
-        "3. event: 问题场景事件，例如 起火、泄漏、皮肤接触、眼睛接触、吸入；没有就写空字符串。\n"
-        "4. bridge: 中间环节，例如 燃烧产物、危险性类别、反应产物；没有就写空字符串。\n"
-        "5. target: 最终关注目标，例如 症状、严重后果、处置措施、防护要求、监测方式；没有就写空字符串。\n"
-        "6. constraint: 题目中的限制词列表，例如 最早、一般、严重、立即；没有就返回空列表。\n"
-        "7. 不要添加图谱里可能存在但题目没有出现的实体。\n"
-        '8. 只输出JSON，例如 {"chemicals":["1,6-己二胺"],"event":"起火","bridge":"燃烧产物","target":"吸入症状","constraint":["最早","一般"]}。\n'
+        "1. chemicals: 只抽取问题中直接出现的化学品，数量不固定，可以是0个、1个或多个。"
+        "必须保留题目中的完整写法，包括括号、位次词以及浓度、形态、配方等修饰，"
+        "例如 (对)异丙基苯酚、含量≥60%的双氧水、乙酸溶液、无涂层的铝 都要原样保留。\n"
+        "2. event: 问题场景事件，例如 起火、泄漏、皮肤接触、眼睛接触、吸入、运输；没有就写空字符串。\n"
+        "3. bridge: 只有当问题需要先找到一个中间对象、再问这个中间对象的信息时才填写。"
+        "例如 'X的燃烧产物的急救措施' 中 bridge=燃烧产物；'X被划为某危险性类别后的防护要求' 中 bridge=危险性类别；"
+        "'X的禁配物泄漏时怎么处置' 中 bridge=禁配物。"
+        "如果问题直接问某个字段（例如 'X的燃烧产物是什么'、'X的禁配物是什么'），这个字段是 target，bridge 留空。\n"
+        "4. target: 最终要回答的字段，尽量用图谱字段式的短语，例如 燃烧产物、禁配物、推荐灭火剂、急救措施、"
+        "防护要求、分类依据、危险说明、闪点、外观与性状；问题总有要回答的内容，不要留空。\n"
+        "5. constraint: 会改变适用哪条图谱事实的限定条件列表，例如 浓度或含量（30%、含量≥60%）、"
+        "物理形态（固体、粉末、溶液、液化、气体）、配方或规格（母液、水合物、无水、有涂层、无涂层、工业级）、"
+        "物品或包装（钢瓶）、暴露途径（经皮、吸入、经口）；没有就返回空列表。"
+        "不要把 '一般'、'最早'、'严重'、'立即' 这类程度词当作约束。\n"
+        "6. 不要添加题目中没有出现的实体。\n"
+        '7. 只输出JSON，例如 {"chemicals":["含量≥60%的双氧水"],"event":"","bridge":"危险性类别",'
+        '"target":"分类依据","constraint":["含量≥60%"]}。\n'
         f"问题：{question}"
     )
 
@@ -118,6 +134,7 @@ def build_candidate_prune_prompt(
         "打分参考：0.9-1.0 直接回答问题核心；0.7-0.89 强相关；0.4-0.69 只有部分帮助；0.0-0.39 基本无帮助。\n"
         "请必须拉开最优项和次优项的分数差距。\n"
         '输出必须是 JSON，优先使用 {"selected":[{"name":"...","score":0.95}, ...]} 这种格式。\n'
+        "name 字段只写候选值本身，不要带上 | 之后的三元组部分。\n"
         "每个候选项必须包含 name 和 score 两个字段，不要改字段名。\n"
         f"Q: {question}\n"
         f"Root: {root_entity}\n"
@@ -160,6 +177,101 @@ def build_entity_reasoning_prompt(
         f"当前路径：{current_path}\n"
         f"当前缺失线索：{clue or '无'}\n"
         f"{slot_block}"
+    )
+
+
+JOINT_SUFFICIENCY_SYSTEM = (
+    "你是危化品知识图谱问答中的证据充分性判定器。"
+    "你只依据给出的候选证据路径做判断，不使用路径之外的知识。"
+    "输出必须是一个JSON对象。"
+)
+
+
+def build_joint_sufficiency_prompt(
+    *,
+    question: str,
+    entity_name: str,
+    paths: list[str],
+    clue: str,
+    query_slots: dict[str, Any] | None = None,
+    min_hops: int = 1,
+) -> str:
+    """Judge a *set* of candidate paths for one chemical.
+
+    The per-path judge (build_entity_reasoning_prompt) can never accept an
+    answer that is spread over several sibling facts, e.g. a precaution list
+    whose items are separate graph tails. Error analysis showed this is where
+    most multi-hop abstentions came from (gold answers with 2-3 parts). Here
+    the judge sees the candidate pool and names the supporting subset, which
+    the caller then validates deterministically.
+    """
+    numbered = "\n".join(f"{idx}. {path}" for idx, path in enumerate(paths, start=1)) or "（无）"
+    structural = (
+        "本题需要经过中间环节（Bridge）：支持路径中至少要有一条经过该中间环节、不少于2跳的路径。\n"
+        if min_hops >= 2 else ""
+    )
+    example = {
+        "sufficient": True,
+        "support": [1, 3],
+        "slot_support": {"target": [1, 3], "bridge": [1], "constraint": []},
+        "missing": "",
+    }
+    return (
+        "下面是同一个化学品在知识图谱中的若干条候选证据路径。"
+        "请判断其中是否存在一组路径，合起来足以回答问题中与该化学品相关的部分。\n"
+        "判定规则：\n"
+        "1. 必须有路径给出问题所问目标字段（Target）的内容。\n"
+        "2. 如果有中间环节（Bridge），支持路径必须经过它，而且目标字段必须属于中间对象，"
+        "不能用化学品自身的同名字段代替。\n"
+        "3. 如果有约束（Constraint，如浓度、形态、配方、有无涂层、物品类型、暴露途径），"
+        "必须有路径中的关系名或实体明确对应该约束；不能用不带该约束的一般信息代替。\n"
+        "4. 问题同时问多个方面时（例如同时问隔离距离和灭火剂），每个方面都要有路径支撑；"
+        "可以组合多条路径。\n"
+        "5. 只能依据路径中的事实。\n"
+        f"{structural}"
+        f"输出JSON，例如：{json.dumps(example, ensure_ascii=False)}\n"
+        "support 填支持路径的编号；sufficient=true 时 support 不能为空；"
+        "sufficient=false 时在 missing 中说明缺什么。\n"
+        f"问题：{question}\n"
+        f"当前化学品：{entity_name}\n"
+        f"当前缺失线索：{clue or '无'}\n"
+        f"{_format_query_slots(query_slots)}"
+        "候选路径：\n"
+        f"{numbered}"
+    )
+
+
+SLOT_REPAIR_SYSTEM = (
+    "你是危化品问答中的槽位修正器。"
+    "上一轮检索没有找到充分证据，你需要根据图谱中实际可用的字段修正问题的槽位解析。"
+    "输出必须是一个JSON对象。"
+)
+
+
+def build_slot_repair_prompt(
+    *,
+    question: str,
+    entity_name: str,
+    query_slots: dict[str, Any] | None,
+    missing: str,
+    available_fields: list[str],
+) -> str:
+    fields = "、".join(available_fields[:80]) or "（无）"
+    current = json.dumps(
+        {k: (query_slots or {}).get(k, "" if k != "constraint" else []) for k in ("event", "bridge", "target", "constraint")},
+        ensure_ascii=False,
+    )
+    return (
+        "上一轮按下面的槽位检索后，判定器认为证据不充分。请检查槽位解析是否有误并给出修正。\n"
+        "常见错误：把直接询问的字段误放进 bridge；target 与图谱字段名不一致；漏掉或误加中间环节；"
+        "把程度词当成约束。\n"
+        "可以把 target、bridge 改写为图谱中实际存在的字段名；不要改动问题中出现的约束。\n"
+        '输出JSON：{"event":"...","bridge":"...","target":"...","constraint":[...],"changed":true或false}\n'
+        f"问题：{question}\n"
+        f"化学品：{entity_name}\n"
+        f"当前槽位：{current}\n"
+        f"判定器指出的缺失：{missing or '无'}\n"
+        f"该化学品在图谱中可用的字段：{fields}"
     )
 
 

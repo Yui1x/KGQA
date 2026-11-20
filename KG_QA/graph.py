@@ -30,8 +30,14 @@ def _split_name_field(value: Any) -> list[str]:
 
 
 class HazardNeo4jClient:
-    def __init__(self, uri: str, user: str, password: str):
-        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+    def __init__(self, uri: str, user: str, password: str, max_pool_size: int = 200):
+        # The driver's default pool is 100 connections. With hundreds of
+        # concurrent questions each holding a session for the duration of a
+        # search, the pool becomes the throughput ceiling long before the LLM
+        # API does -- queries queue instead of running. Size it to the workers.
+        self.driver = GraphDatabase.driver(
+            uri, auth=(user, password), max_connection_pool_size=max_pool_size
+        )
         self._name_records_cache: tuple[dict[str, str], ...] | None = None
 
     def close(self) -> None:
